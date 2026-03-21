@@ -26,7 +26,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests
+        run: pip install pandas requests
 
       - name: Search for new datasets and append to registry
         run: python3 update_registry_workflow.py
