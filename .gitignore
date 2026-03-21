@@ -40,3 +40,4 @@ truthseq_test_claims.csv
 test_run/
 test_run2/
 disease_catalog.json
+submit_clawrxiv.py
