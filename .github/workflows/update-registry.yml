@@ -70,6 +70,24 @@ jobs:
           ])
           "
 
+      - name: Deduplicate registry
+        run: |
+          python3 -c "
+          import pandas as pd
+          df = pd.read_csv('dataset_registry.csv')
+          before = len(df)
+          # Normalize accession to string and strip whitespace
+          df['accession'] = df['accession'].astype(str).str.strip()
+          # Keep first occurrence of each accession (preserves curated entries)
+          df = df.drop_duplicates(subset='accession', keep='first')
+          after = len(df)
+          df.to_csv('dataset_registry.csv', index=False)
+          if before != after:
+              print(f'Removed {before - after} duplicate entries ({before} -> {after})')
+          else:
+              print(f'No duplicates found ({after} entries)')
+          "
+
       - name: Check for changes
         id: changes
         run: |

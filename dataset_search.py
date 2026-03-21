@@ -313,10 +313,20 @@ def update_registry(new_results, registry_path=REGISTRY_PATH, min_samples=MIN_SA
 
     existing = pd.read_csv(registry_path) if os.path.exists(registry_path) else pd.DataFrame()
 
-    # Build set of existing accessions, cast to string to avoid type mismatches
+    # Normalize accession column to string to prevent type-mismatch duplicates
+    # (pandas may read '19968745' as int64, while search results return it as str)
+    if 'accession' in existing.columns:
+        existing['accession'] = existing['accession'].astype(str).str.strip()
+        # Remove any pre-existing duplicates in the CSV
+        before_dedup = len(existing)
+        existing = existing.drop_duplicates(subset='accession', keep='first')
+        if len(existing) < before_dedup:
+            log.info(f"  Cleaned {before_dedup - len(existing)} duplicate entries from registry")
+
+    # Build set of existing accessions
     existing_accessions = set()
     if 'accession' in existing.columns:
-        existing_accessions = set(str(a).strip() for a in existing['accession'].tolist())
+        existing_accessions = set(existing['accession'].tolist())
 
     new_rows = []
     skipped_small = 0
