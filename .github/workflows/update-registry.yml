@@ -6,6 +6,9 @@ on:
     - cron: '0 8 * * 1'
   workflow_dispatch:  # Allow manual trigger
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 permissions:
   contents: write
   pull-requests: write
@@ -75,7 +78,7 @@ jobs:
 
       - name: Create pull request
         if: steps.changes.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: "Update dataset registry (automated weekly scan)"
