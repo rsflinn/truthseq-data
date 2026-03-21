@@ -20,6 +20,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Delete stale PR branch
+        run: git push origin --delete automated/registry-update 2>/dev/null || true
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -30,6 +33,21 @@ jobs:
 
       - name: Search GEO/ArrayExpress and update registry
         run: python3 update_registry_workflow.py
+
+      - name: Verify no duplicate headers
+        run: |
+          HEADERS=$(grep -c "^dataset_id\|^\"dataset_id\"" dataset_registry.csv)
+          echo "Header count: $HEADERS"
+          if [ "$HEADERS" -gt 1 ]; then
+            echo "ERROR: Multiple header rows detected. Fixing..."
+            python3 -c "
+          import csv, pandas as pd
+          df = pd.read_csv('dataset_registry.csv')
+          df = df.drop_duplicates(subset='dataset_id', keep='first')
+          df.to_csv('dataset_registry.csv', index=False, quoting=csv.QUOTE_NONNUMERIC)
+          print(f'Fixed: {len(df)} entries')
+          "
+          fi
 
       - name: Check for changes
         id: changes
