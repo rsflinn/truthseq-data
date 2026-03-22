@@ -38,14 +38,38 @@ import time
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
-# Figshare download URL for the Replogle pseudo-bulk h5ad
+# Figshare download URLs for Replogle pseudo-bulk h5ad files
 # Source: Replogle et al. 2022, "Mapping information-rich genotype-phenotype
 # landscapes with genome-scale Perturb-seq" (Cell)
-FIGSHARE_URL = "https://ndownloader.figshare.com/files/35773217"
-H5AD_FILENAME = "K562_gwps_normalized_bulk_01.h5ad"
-H5AD_SIZE_MB = 357  # ~357 MB (pseudo-bulk, not single-cell)
+# Figshare article 20029387
 
-# Output filenames
+CELL_TYPE_REGISTRY = {
+    'K562': {
+        'url': "https://ndownloader.figshare.com/files/35773217",
+        'h5ad': "K562_gwps_normalized_bulk_01.h5ad",
+        'size_mb': 357,
+        'effects_parquet': "replogle_knockdown_effects.parquet",
+        'stats_parquet': "replogle_knockdown_stats.parquet",
+        'description': "K562 (chronic myeloid leukemia, blood-derived) — genome-wide ~11,000 knockdowns",
+        'tissue': 'blood',
+    },
+    'RPE1': {
+        'url': "https://ndownloader.figshare.com/files/35775512",
+        'h5ad': "rpe1_normalized_bulk_01.h5ad",
+        'size_mb': 91,
+        'effects_parquet': "rpe1_knockdown_effects.parquet",
+        'stats_parquet': "rpe1_knockdown_stats.parquet",
+        'description': "RPE1 (retinal pigment epithelial, non-cancerous) — essential gene knockdowns",
+        'tissue': 'retinal epithelium',
+    },
+}
+
+# Default (backward compatible)
+FIGSHARE_URL = CELL_TYPE_REGISTRY['K562']['url']
+H5AD_FILENAME = CELL_TYPE_REGISTRY['K562']['h5ad']
+H5AD_SIZE_MB = CELL_TYPE_REGISTRY['K562']['size_mb']
+
+# Output filenames (backward compatible defaults)
 EFFECTS_PARQUET = "replogle_knockdown_effects.parquet"
 STATS_PARQUET = "replogle_knockdown_stats.parquet"
 GENE_MAP_FILE = "gene_id_mapping.tsv"
@@ -55,64 +79,95 @@ def check_status(work_dir):
     """Report what data files exist and their stats."""
     print("\n=== TruthSeq Data Status ===\n")
 
-    files = {
-        H5AD_FILENAME: "Replogle h5ad (pseudo-bulk source, ~357 MB)",
-        EFFECTS_PARQUET: "Knockdown effects parquet (Tier 1 data)",
-        STATS_PARQUET: "Knockdown distribution stats (for percentile calculations)",
-        GENE_MAP_FILE: "Gene ID mapping (for Open Targets, Tier 3)",
-    }
+    # Check each cell type
+    any_ready = False
+    ready_cell_types = []
+    for ct_name, ct_info in CELL_TYPE_REGISTRY.items():
+        print(f"  {ct_name} ({ct_info['tissue']}):")
+        h5ad_path = os.path.join(work_dir, ct_info['h5ad'])
+        eff_path = os.path.join(work_dir, ct_info['effects_parquet'])
+        stats_path = os.path.join(work_dir, ct_info['stats_parquet'])
 
-    all_ready = True
-    for fname, desc in files.items():
-        fpath = os.path.join(work_dir, fname)
-        if os.path.exists(fpath):
-            size_mb = os.path.getsize(fpath) / 1024 / 1024
-            print(f"  [OK] {fname} ({size_mb:.1f} MB) — {desc}")
-        else:
-            print(f"  [--] {fname} — {desc}")
-            if fname in (EFFECTS_PARQUET, STATS_PARQUET):
-                all_ready = False
+        ct_ready = True
+        for fpath, desc in [(h5ad_path, "h5ad source"), (eff_path, "effects parquet"),
+                            (stats_path, "stats parquet")]:
+            fname = os.path.basename(fpath)
+            if os.path.exists(fpath):
+                size_mb = os.path.getsize(fpath) / 1024 / 1024
+                print(f"    [OK] {fname} ({size_mb:.1f} MB)")
+            else:
+                print(f"    [--] {fname}")
+                if desc != "h5ad source":
+                    ct_ready = False
+
+        if ct_ready and os.path.exists(eff_path):
+            ready_cell_types.append(ct_name)
+            any_ready = True
+        print()
+
+    # Gene map
+    gene_map_path = os.path.join(work_dir, GENE_MAP_FILE)
+    if os.path.exists(gene_map_path):
+        size_mb = os.path.getsize(gene_map_path) / 1024 / 1024
+        print(f"  [OK] {GENE_MAP_FILE} ({size_mb:.1f} MB) — gene ID mapping")
+    else:
+        print(f"  [--] {GENE_MAP_FILE} — gene ID mapping (optional, for Tier 3)")
 
     print()
-    if all_ready:
-        print("Ready to validate! Run:")
-        print(f"  python3 truthseq_validate.py --claims your_claims.csv \\")
-        print(f"      --replogle {EFFECTS_PARQUET} \\")
-        print(f"      --replogle-stats {STATS_PARQUET}")
+    if any_ready:
+        print(f"Ready cell types: {', '.join(ready_cell_types)}")
+        print()
+        if len(ready_cell_types) == 1:
+            ct = CELL_TYPE_REGISTRY[ready_cell_types[0]]
+            print("Run validation:")
+            print(f"  python3 truthseq_validate.py --claims your_claims.csv \\")
+            print(f"      --replogle {ct['effects_parquet']} \\")
+            print(f"      --replogle-stats {ct['stats_parquet']}")
+        else:
+            print("Run multi-cell-type validation:")
+            replogle_args = ','.join(CELL_TYPE_REGISTRY[ct]['effects_parquet'] for ct in ready_cell_types)
+            stats_args = ','.join(CELL_TYPE_REGISTRY[ct]['stats_parquet'] for ct in ready_cell_types)
+            print(f"  python3 truthseq_validate.py --claims your_claims.csv \\")
+            print(f"      --replogle {replogle_args} \\")
+            print(f"      --replogle-stats {stats_args}")
     else:
         print("Setup needed. Run: python3 setup.py")
 
     print()
-    return all_ready
+    return any_ready
 
 
-def download_h5ad(work_dir):
-    """Download the Replogle h5ad from Figshare."""
+def download_h5ad(work_dir, cell_type='K562'):
+    """Download the Replogle h5ad from Figshare for a given cell type."""
     import requests
 
-    output_path = os.path.join(work_dir, H5AD_FILENAME)
+    ct_info = CELL_TYPE_REGISTRY[cell_type]
+    output_path = os.path.join(work_dir, ct_info['h5ad'])
+    url = ct_info['url']
+    size_mb = ct_info['size_mb']
 
     if os.path.exists(output_path):
-        size_mb = os.path.getsize(output_path) / 1024 / 1024
-        if size_mb > 50:  # Sanity check: file should be >50 MB
-            log.info(f"h5ad file already exists: {output_path} ({size_mb:.0f} MB)")
+        existing_size = os.path.getsize(output_path) / 1024 / 1024
+        if existing_size > 50:  # Sanity check: file should be >50 MB
+            log.info(f"h5ad file already exists: {output_path} ({existing_size:.0f} MB)")
             return output_path
         else:
-            log.warning(f"h5ad file exists but is suspiciously small ({size_mb:.1f} MB). Re-downloading.")
+            log.warning(f"h5ad file exists but is suspiciously small ({existing_size:.1f} MB). Re-downloading.")
 
     print()
     print("=" * 70)
-    print("Step 1: Download Replogle Perturb-seq data from Figshare")
+    print(f"Download {cell_type} Perturb-seq data from Figshare")
     print("=" * 70)
     print(f"  Source: Replogle et al. 2022 (Cell)")
-    print(f"  File size: ~{H5AD_SIZE_MB / 1000:.1f} GB")
-    print(f"  URL: {FIGSHARE_URL}")
+    print(f"  Cell type: {ct_info['description']}")
+    print(f"  File size: ~{size_mb} MB")
+    print(f"  URL: {url}")
     print()
 
-    log.info("Starting download (this may take 10-30 minutes depending on your connection)...")
+    log.info(f"Starting {cell_type} download...")
 
     try:
-        resp = requests.get(FIGSHARE_URL, stream=True, timeout=30)
+        resp = requests.get(url, stream=True, timeout=30)
         resp.raise_for_status()
 
         total_size = int(resp.headers.get('content-length', 0))
@@ -149,7 +204,7 @@ def download_h5ad(work_dir):
         return None
 
 
-def process_h5ad(h5ad_path, work_dir):
+def process_h5ad(h5ad_path, work_dir, cell_type='K562'):
     """
     Process the h5ad into parquet files.
     Extracts knockdown effects and per-knockdown distribution statistics.
@@ -158,14 +213,16 @@ def process_h5ad(h5ad_path, work_dir):
     import scanpy as sc
     from scipy import stats as sp_stats
 
+    ct_info = CELL_TYPE_REGISTRY[cell_type]
+
     print()
     print("=" * 70)
-    print("Step 2: Process h5ad into TruthSeq format")
+    print(f"Process {cell_type} h5ad into TruthSeq format")
     print("=" * 70)
     print()
 
-    effects_path = os.path.join(work_dir, EFFECTS_PARQUET)
-    stats_path = os.path.join(work_dir, STATS_PARQUET)
+    effects_path = os.path.join(work_dir, ct_info['effects_parquet'])
+    stats_path = os.path.join(work_dir, ct_info['stats_parquet'])
 
     import numpy as np
     import pandas as pd
@@ -288,7 +345,7 @@ def process_h5ad(h5ad_path, work_dir):
                 'knocked_down_gene': kd_gene,
                 'affected_gene': affected_gene,
                 'z_score': round(float(z_score), 4),
-                'cell_line': 'K562',
+                'cell_line': cell_type,
             })
 
     log.info(f"  Total knockdowns: {len(all_stats)}")
@@ -405,6 +462,9 @@ See format_spec.md for disease expression file format.
                         help='Skip h5ad download (re-process existing file)')
     parser.add_argument('--skip-gene-map', action='store_true',
                         help='Skip gene ID mapping (Tier 3 optional)')
+    parser.add_argument('--cell-types', default='K562',
+                        help='Comma-separated cell types to set up (default: K562). '
+                             f'Available: {", ".join(CELL_TYPE_REGISTRY.keys())}')
     parser.add_argument('--dir', default='.',
                         help='Working directory (default: current)')
 
@@ -415,40 +475,52 @@ See format_spec.md for disease expression file format.
         check_status(work_dir)
         return 0
 
+    # Parse cell types
+    requested_types = [ct.strip().upper() for ct in args.cell_types.split(',')]
+    for ct in requested_types:
+        if ct not in CELL_TYPE_REGISTRY:
+            log.error(f"Unknown cell type: {ct}. Available: {', '.join(CELL_TYPE_REGISTRY.keys())}")
+            return 1
+
+    total_size = sum(CELL_TYPE_REGISTRY[ct]['size_mb'] for ct in requested_types)
+
     print()
     print("=" * 70)
     print("  TruthSeq Setup")
     print("  Preparing Replogle Perturb-seq reference data")
     print("=" * 70)
     print()
-    print("  This will download ~357 MB of Perturb-seq data from Figshare")
-    print("  and process it into parquet files for fast validation.")
-    print()
+    print(f"  Cell types: {', '.join(requested_types)}")
+    print(f"  Total download: ~{total_size} MB of Perturb-seq data from Figshare")
     print(f"  Working directory: {work_dir}")
     print()
 
-    # Step 1: Download
-    h5ad_path = os.path.join(work_dir, H5AD_FILENAME)
-    if args.skip_download:
-        if not os.path.exists(h5ad_path):
-            log.error(f"h5ad not found at {h5ad_path}")
-            log.error("Run without --skip-download to download it first.")
-            return 1
-        log.info(f"Skipping download. Using existing: {h5ad_path}")
-    else:
-        h5ad_path = download_h5ad(work_dir)
-        if h5ad_path is None:
-            return 1
+    for cell_type in requested_types:
+        ct_info = CELL_TYPE_REGISTRY[cell_type]
+        log.info(f"--- Setting up {cell_type}: {ct_info['description']} ---")
 
-    # Step 2: Process
-    effects_path = os.path.join(work_dir, EFFECTS_PARQUET)
-    stats_path = os.path.join(work_dir, STATS_PARQUET)
+        # Step 1: Download
+        h5ad_path = os.path.join(work_dir, ct_info['h5ad'])
+        if args.skip_download:
+            if not os.path.exists(h5ad_path):
+                log.error(f"h5ad not found at {h5ad_path}")
+                log.error("Run without --skip-download to download it first.")
+                return 1
+            log.info(f"Skipping download. Using existing: {h5ad_path}")
+        else:
+            h5ad_path = download_h5ad(work_dir, cell_type=cell_type)
+            if h5ad_path is None:
+                return 1
 
-    if os.path.exists(effects_path) and os.path.exists(stats_path):
-        log.info(f"Parquet files already exist. Skipping processing.")
-        log.info(f"  (Delete {EFFECTS_PARQUET} and {STATS_PARQUET} to force reprocessing)")
-    else:
-        process_h5ad(h5ad_path, work_dir)
+        # Step 2: Process
+        effects_path = os.path.join(work_dir, ct_info['effects_parquet'])
+        stats_path = os.path.join(work_dir, ct_info['stats_parquet'])
+
+        if os.path.exists(effects_path) and os.path.exists(stats_path):
+            log.info(f"Parquet files for {cell_type} already exist. Skipping processing.")
+            log.info(f"  (Delete {ct_info['effects_parquet']} and {ct_info['stats_parquet']} to force reprocessing)")
+        else:
+            process_h5ad(h5ad_path, work_dir, cell_type=cell_type)
 
     # Step 3: Gene map (optional)
     if not args.skip_gene_map:

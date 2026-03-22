@@ -50,7 +50,7 @@ It can't test broader biological questions like "does this mutation cause drug r
 ## What you need
 
 - Python 3.8 or later (type `python3 --version` in your terminal to check)
-- About 500 MB of free disk space for the experimental dataset
+- About 500 MB of free disk space for the experimental dataset (K562 only) or ~600 MB for both cell types
 - A CSV file of gene regulatory predictions to test (or use the included example to try it out)
 
 ## Setup
@@ -59,11 +59,14 @@ It can't test broader biological questions like "does this mutation cause drug r
 # Install the Python libraries TruthSeq needs
 pip3 install scanpy anndata pandas pyarrow numpy scipy requests
 
-# Download the experimental dataset (~357 MB from Figshare, a public data repository)
+# Download the K562 experimental dataset (~357 MB from Figshare)
 python3 setup.py
+
+# Or set up both cell types at once (~448 MB total)
+python3 setup.py --cell-types K562,RPE1
 ```
 
-The setup script downloads the Replogle Perturb-seq atlas from Figshare (~357 MB). This is real lab data, not a model or simulation. It takes a few minutes depending on your connection.
+The setup script downloads the Replogle Perturb-seq atlas from Figshare. This is real lab data, not a model or simulation. K562 (blood-derived, ~11,000 knockdowns) is the default and most comprehensive. RPE1 (retinal epithelial, non-cancerous, ~91 MB) covers essential gene knockdowns and provides a second independent cell type for cross-validation.
 
 ## Your first validation
 
@@ -113,6 +116,20 @@ What to expect: SLC30A1 → MT2A (zinc transporter knockout triggers metallothio
 - **WEAK** — The regulator was tested but the target gene didn't respond much. This doesn't mean the relationship is definitely wrong (see caveats below).
 - **CONTRADICTED** — The lab data shows the opposite of what was predicted.
 - **UNTESTABLE** — The regulator gene wasn't in the experimental dataset.
+
+## Multi-cell-type validation
+
+If you set up both K562 and RPE1, you can validate against both cell types simultaneously. TruthSeq reports results from each cell type and uses the strongest evidence across them for the final grade.
+
+```bash
+python3 truthseq_validate.py \
+    --claims claims.csv \
+    --replogle replogle_knockdown_effects.parquet,rpe1_knockdown_effects.parquet \
+    --replogle-stats replogle_knockdown_stats.parquet,rpe1_knockdown_stats.parquet \
+    --output results
+```
+
+When a gene-gene relationship is tested in multiple cell types, the report shows results from each. A claim that scores VALIDATED in K562 but WEAK in RPE1 tells you the relationship may be cell-type-specific — which is biologically informative, not a failure. A claim VALIDATED in both cell types is stronger evidence.
 
 ## Adding disease context
 
@@ -199,6 +216,37 @@ The pool file is one gene symbol per line (lines starting with # are ignored).
 The specificity test checks whether your individual regulatory edges are stronger than what random genes would produce. It does not test whether your gene set as a whole has special network-level properties — for example, whether your genes converge on the same targets more than comparable gene sets do. That's a different question (and a harder one). Passing the specificity test means your individual claims are real and non-trivial. It doesn't mean the network connecting them has special properties beyond what the individual edges contribute.
 
 You can adjust the number of permutations with `--specificity-perms` (default: 1000).
+
+## Convergence test: Does the wiring matter?
+
+The specificity test asks whether your genes are special. The convergence test asks the harder question: does the specific *wiring* between them matter?
+
+It keeps all the same upstream and downstream genes but randomly re-pairs them. If Gene A→Gene X and Gene B→Gene Y is your claim, the test shuffles to Gene A→Gene Y and Gene B→Gene X and asks whether the scrambled pairings score just as well.
+
+```bash
+python3 truthseq_validate.py \
+    --claims claims.csv \
+    --replogle replogle_knockdown_effects.parquet \
+    --replogle-stats replogle_knockdown_stats.parquet \
+    --convergence \
+    --output results
+```
+
+This is the test that distinguishes "these genes are individually important" from "the network connecting them has biological structure." A gene set can pass the specificity test (individual edges are real and strong) but fail the convergence test (random rewiring scores equally well). That would mean the genes are special but the specific connections between them are not — any pairing of the same genes would produce similar downstream effects.
+
+You can combine both tests in one run:
+
+```bash
+python3 truthseq_validate.py \
+    --claims claims.csv \
+    --replogle replogle_knockdown_effects.parquet \
+    --replogle-stats replogle_knockdown_stats.parquet \
+    --specificity \
+    --convergence \
+    --output results
+```
+
+Adjust permutations with `--convergence-perms` (default: 1000). Requires at least 4 claims with 2+ unique upstream and 2+ unique downstream genes.
 
 ## Important caveats
 

@@ -71,23 +71,70 @@ def load_claims(path):
 
 
 def load_replogle(path):
-    if path and os.path.exists(path):
-        df = pd.read_parquet(path)
-        log.info(f"Loaded Replogle data: {len(df):,} gene-gene pairs")
-        log.info(f"  Unique knockdowns: {df['knocked_down_gene'].nunique():,}")
-        return df
-    log.warning(f"Replogle data not found at {path} — Tier 1 validation disabled")
-    return None
+    """Load one or more Tier 1 parquet files (comma-separated paths supported)."""
+    if not path:
+        log.warning("No Replogle data path — Tier 1 validation disabled")
+        return None
+
+    paths = [p.strip() for p in path.split(',')]
+    dfs = []
+    for p in paths:
+        if os.path.exists(p):
+            df = pd.read_parquet(p)
+            # Ensure cell_line column exists
+            if 'cell_line' not in df.columns:
+                # Infer from filename
+                fname = os.path.basename(p).lower()
+                if 'rpe1' in fname:
+                    df['cell_line'] = 'RPE1'
+                else:
+                    df['cell_line'] = 'K562'
+            log.info(f"Loaded {p}: {len(df):,} pairs, "
+                     f"{df['knocked_down_gene'].nunique():,} knockdowns, "
+                     f"cell type: {df['cell_line'].iloc[0]}")
+            dfs.append(df)
+        else:
+            log.warning(f"Replogle data not found at {p} — skipping")
+
+    if not dfs:
+        log.warning("No Replogle data loaded — Tier 1 validation disabled")
+        return None
+
+    combined = pd.concat(dfs, ignore_index=True)
+    cell_types = combined['cell_line'].unique()
+    log.info(f"Combined Tier 1 data: {len(combined):,} pairs across {len(cell_types)} "
+             f"cell type(s): {', '.join(cell_types)}")
+    return combined
 
 
 def load_replogle_stats(path):
-    """Load per-knockdown distribution statistics (v2 feature)."""
-    if path and os.path.exists(path):
-        df = pd.read_parquet(path)
-        log.info(f"Loaded Replogle stats: {len(df)} knockdowns with distribution data")
-        return df
-    log.info("No Replogle stats file — percentile calculations will use hits-only distribution")
-    return None
+    """Load per-knockdown distribution statistics (comma-separated paths supported)."""
+    if not path:
+        log.info("No Replogle stats file — percentile calculations will use hits-only distribution")
+        return None
+
+    paths = [p.strip() for p in path.split(',')]
+    dfs = []
+    for p in paths:
+        if os.path.exists(p):
+            df = pd.read_parquet(p)
+            # Infer cell type from filename if not present
+            if 'cell_line' not in df.columns:
+                fname = os.path.basename(p).lower()
+                if 'rpe1' in fname:
+                    df['cell_line'] = 'RPE1'
+                else:
+                    df['cell_line'] = 'K562'
+            log.info(f"Loaded stats {p}: {len(df)} knockdowns")
+            dfs.append(df)
+        else:
+            log.info(f"Stats file not found: {p}")
+
+    if not dfs:
+        log.info("No Replogle stats loaded — percentile calculations will use hits-only distribution")
+        return None
+
+    return pd.concat(dfs, ignore_index=True)
 
 
 def load_gene_map(path):
@@ -184,30 +231,72 @@ def validate_perturbation(claims, replogle_df, stats_df=None):
 
         if len(target_hit) > 0:
             # Direct hit found — same logic as v1 but with better percentile calc
-            observed_z = float(target_hit.iloc[0]['z_score'])
-            cell_line = target_hit.iloc[0].get('cell_line', 'K562')
+            # If multiple cell types have hits, report the strongest and list all
+            cell_types_in_hit = target_hit['cell_line'].unique() if 'cell_line' in target_hit.columns else ['K562']
+            per_ct_results = []
 
-            # Invert: z < 0 means KO reduced target, so gene normally activates it (UP)
-            # z > 0 means KO increased target, so gene normally represses it (DOWN)
-            observed_dir = "UP" if observed_z < 0 else "DOWN"
-            direction_match = (observed_dir == predicted_dir)
+            for ct in cell_types_in_hit:
+                ct_hits = target_hit[target_hit['cell_line'] == ct] if 'cell_line' in target_hit.columns else target_hit
+                ct_z = float(ct_hits.iloc[0]['z_score'])
+                ct_dir = "UP" if ct_z < 0 else "DOWN"
+                ct_dir_match = (ct_dir == predicted_dir)
 
-            # Compute percentile rank
-            percentile = None
+                # Percentile for this cell type
+                ct_pct = None
+                if stats_df is not None:
+                    ct_stats = stats_df[(stats_df['knocked_down_gene'] == upstream)]
+                    if 'cell_line' in stats_df.columns:
+                        ct_stats = ct_stats[ct_stats['cell_line'] == ct]
+                    if len(ct_stats) > 0:
+                        ct_pct = compute_percentile_from_stats(ct_z, ct_stats.iloc[0])
 
-            # Try stats-based percentile first (most accurate)
-            if stats_df is not None and upstream in stats_kd_genes:
-                stats_row = stats_df[stats_df['knocked_down_gene'] == upstream].iloc[0]
-                percentile = compute_percentile_from_stats(observed_z, stats_row)
+                if ct_pct is None:
+                    ct_kd = kd_data
+                    if 'cell_line' in kd_data.columns:
+                        ct_kd = kd_data[kd_data['cell_line'] == ct]
+                    all_z = ct_kd['z_score'].values
+                    if len(all_z) > NULL_SAMPLE_SIZE:
+                        null_sample = np.random.choice(all_z, NULL_SAMPLE_SIZE, replace=False)
+                    else:
+                        null_sample = all_z
+                    ct_pct = float(sp_stats.percentileofscore(np.abs(null_sample), abs(ct_z)))
 
-            # Fallback: compute from available hits
-            if percentile is None:
-                all_z_for_this_kd = kd_data['z_score'].values
-                if len(all_z_for_this_kd) > NULL_SAMPLE_SIZE:
-                    null_sample = np.random.choice(all_z_for_this_kd, NULL_SAMPLE_SIZE, replace=False)
-                else:
-                    null_sample = all_z_for_this_kd
-                percentile = float(sp_stats.percentileofscore(np.abs(null_sample), abs(observed_z)))
+                per_ct_results.append({
+                    'cell_line': ct,
+                    'z_score': round(ct_z, 4),
+                    'direction_match': ct_dir_match,
+                    'percentile': round(ct_pct, 1),
+                })
+
+            # Use the result with the highest percentile as the primary
+            best = max(per_ct_results, key=lambda x: x['percentile'])
+            observed_z = best['z_score']
+            cell_line = best['cell_line']
+            direction_match = best['direction_match']
+            percentile = best['percentile']
+
+            # Build note with all cell types
+            if len(per_ct_results) > 1:
+                ct_details = '; '.join(
+                    f"{r['cell_line']}: Z={r['z_score']:.2f}, "
+                    f"{'matches' if r['direction_match'] else 'OPPOSES'}, "
+                    f"{r['percentile']:.0f}th pctl"
+                    for r in per_ct_results
+                )
+                note = (
+                    f"Knockdown of {upstream} changed {downstream} expression "
+                    f"in {len(per_ct_results)} cell types. "
+                    f"Best: {cell_line} (Z={observed_z:.2f}, "
+                    f"{'matches' if direction_match else 'OPPOSES'} prediction, "
+                    f"{percentile:.0f}th pctl). All: {ct_details}."
+                )
+            else:
+                note = (
+                    f"Knockdown of {upstream} changed {downstream} expression "
+                    f"(Z={observed_z:.2f}, direction={'matches' if direction_match else 'OPPOSES'} prediction, "
+                    f"percentile={percentile:.0f}% vs random genes after same knockdown). "
+                    f"Cell line: {cell_line}."
+                )
 
             results[idx] = {
                 'perturb_status': 'DATA_FOUND',
@@ -217,12 +306,8 @@ def validate_perturbation(claims, replogle_df, stats_df=None):
                 'perturb_cell_line': cell_line,
                 'perturb_null_mean': None,
                 'perturb_null_std': None,
-                'perturb_note': (
-                    f"Knockdown of {upstream} changed {downstream} expression "
-                    f"(Z={observed_z:.2f}, direction={'matches' if direction_match else 'OPPOSES'} prediction, "
-                    f"percentile={percentile:.0f}% vs random genes after same knockdown). "
-                    f"Cell line: {cell_line}."
-                )
+                'perturb_note': note,
+                'perturb_cell_type_details': per_ct_results if len(per_ct_results) > 1 else None,
             }
 
         elif stats_df is not None and upstream in stats_kd_genes:
@@ -998,7 +1083,211 @@ def compute_specificity(results_df, replogle_df, stats_df=None, n_permutations=1
     return result
 
 
-def generate_summary_report(results_df, base_rate, disease_source, output_dir, specificity=None):
+def compute_convergence(results_df, replogle_df, stats_df=None, n_permutations=1000):
+    """
+    Network convergence test: Does the WIRING between your upstream and downstream genes
+    matter, or would random pairings of the same genes produce similar results?
+
+    This is a harder test than specificity. Specificity asks whether your upstream genes
+    are special (compared to random genes). Convergence asks whether the specific
+    connections between your genes are special (compared to random connections between
+    the SAME genes).
+
+    For each permutation:
+      - Keep the exact same upstream genes and downstream genes
+      - Randomly re-pair them (shuffle which upstream maps to which downstream)
+      - Score the shuffled pairings
+
+    If random pairings score equally well, then the individual genes matter but the
+    network connecting them does not. If your actual pairings score better, the specific
+    wiring has biological meaning beyond the individual nodes.
+
+    This test requires at least 4 claims with at least 2 unique upstream and 2 unique
+    downstream genes (otherwise shuffling is trivial or impossible).
+    """
+    if replogle_df is None:
+        return None
+
+    # Check minimum requirements
+    n_claims = len(results_df)
+    unique_up = results_df['upstream_gene'].unique()
+    unique_down = results_df['downstream_gene'].unique()
+
+    if n_claims < 4:
+        log.warning("Convergence test requires at least 4 claims. Skipping.")
+        return None
+    if len(unique_up) < 2 or len(unique_down) < 2:
+        log.warning("Convergence test requires at least 2 unique upstream AND "
+                     "2 unique downstream genes. Skipping.")
+        return None
+
+    log.info("Running convergence test...")
+    log.info(f"  {n_claims} claims, {len(unique_up)} upstream genes, {len(unique_down)} downstream genes")
+    np.random.seed(RANDOM_SEED + 3)
+
+    # Build lookup: (upstream, downstream) -> z_score (sample for memory)
+    max_pairs = 2_000_000
+    if len(replogle_df) > max_pairs:
+        sim_df = replogle_df.sample(n=max_pairs, random_state=RANDOM_SEED)
+    else:
+        sim_df = replogle_df
+
+    pair_z = dict(zip(
+        zip(sim_df['knocked_down_gene'], sim_df['affected_gene']),
+        sim_df['z_score']
+    ))
+
+    # Ensure user's actual claim pairs are in the index
+    for _, row in results_df.iterrows():
+        up, down = row['upstream_gene'], row['downstream_gene']
+        if (up, down) not in pair_z:
+            mask = (replogle_df['knocked_down_gene'] == up) & (replogle_df['affected_gene'] == down)
+            hits = replogle_df.loc[mask]
+            if len(hits) > 0:
+                pair_z[(up, down)] = float(hits.iloc[0]['z_score'])
+
+    # Per-knockdown |Z| distributions for percentile calculation
+    kd_abs_z = {}
+    for kd_gene in unique_up:
+        kd_data = sim_df[sim_df['knocked_down_gene'] == kd_gene]
+        if len(kd_data) > 0:
+            kd_abs_z[kd_gene] = np.sort(kd_data['z_score'].abs().values)
+        else:
+            # Try full dataset
+            kd_data = replogle_df[replogle_df['knocked_down_gene'] == kd_gene]
+            if len(kd_data) > 0:
+                kd_abs_z[kd_gene] = np.sort(kd_data['z_score'].abs().values[:5000])
+
+    def score_pairings(upstreams, downstreams, directions):
+        """Score a set of upstream-downstream pairings."""
+        total_abs_z = 0
+        n_supported = 0
+        percentiles = []
+        n_dir_match = 0
+        n_testable = 0
+
+        for up, down, pred_dir in zip(upstreams, downstreams, directions):
+            z = pair_z.get((up, down))
+            if z is None:
+                continue
+
+            n_testable += 1
+            abs_z = abs(z)
+            total_abs_z += abs_z
+
+            # Direction check
+            observed_dir = "UP" if z < 0 else "DOWN"
+            if observed_dir == pred_dir:
+                n_dir_match += 1
+
+            # Percentile
+            if up in kd_abs_z:
+                pct = float(sp_stats.percentileofscore(kd_abs_z[up], abs_z))
+            else:
+                pct = 50.0
+            percentiles.append(pct)
+
+            # Would this grade as supported?
+            if observed_dir == pred_dir and pct >= PERCENTILE_PARTIAL:
+                n_supported += 1
+
+        mean_pct = np.mean(percentiles) if percentiles else 0
+        # Convergence metric: how concentrated are the downstream effects?
+        # Higher total_abs_z means the wiring captures stronger effects
+        return {
+            'n_supported': n_supported,
+            'mean_percentile': mean_pct,
+            'total_effect_strength': total_abs_z,
+            'n_direction_match': n_dir_match,
+            'n_testable': n_testable,
+        }
+
+    # Score the actual pairings
+    user_upstreams = results_df['upstream_gene'].tolist()
+    user_downstreams = results_df['downstream_gene'].tolist()
+    user_directions = results_df['predicted_direction'].tolist()
+
+    user_score = score_pairings(user_upstreams, user_downstreams, user_directions)
+    log.info(f"  Actual wiring: {user_score['n_supported']}/{user_score['n_testable']} supported, "
+             f"mean {user_score['mean_percentile']:.1f}th pctl, "
+             f"total effect {user_score['total_effect_strength']:.2f}")
+
+    # Permutations: shuffle pairings
+    # Strategy: keep upstream list fixed, shuffle the downstream+direction assignments
+    null_supported = []
+    null_percentiles = []
+    null_total_effects = []
+    null_dir_matches = []
+
+    # Build pairing indices
+    down_dir_pairs = list(zip(user_downstreams, user_directions))
+
+    for perm_i in range(n_permutations):
+        if perm_i % 200 == 0:
+            log.info(f"  Permutation {perm_i}/{n_permutations}...")
+
+        # Shuffle downstream assignments (keep upstream fixed)
+        shuffled = down_dir_pairs.copy()
+        np.random.shuffle(shuffled)
+        shuf_downs = [s[0] for s in shuffled]
+        shuf_dirs = [s[1] for s in shuffled]
+
+        perm_score = score_pairings(user_upstreams, shuf_downs, shuf_dirs)
+        null_supported.append(perm_score['n_supported'])
+        null_percentiles.append(perm_score['mean_percentile'])
+        null_total_effects.append(perm_score['total_effect_strength'])
+        null_dir_matches.append(perm_score['n_direction_match'])
+
+    null_supported = np.array(null_supported)
+    null_percentiles = np.array(null_percentiles)
+    null_total_effects = np.array(null_total_effects)
+    null_dir_matches = np.array(null_dir_matches)
+
+    # Calculate where user's actual wiring ranks
+    supported_rank = float(np.mean(null_supported >= user_score['n_supported']))
+    percentile_rank = float(np.mean(null_percentiles >= user_score['mean_percentile']))
+    effect_rank = float(np.mean(null_total_effects >= user_score['total_effect_strength']))
+    direction_rank = float(np.mean(null_dir_matches >= user_score['n_direction_match']))
+
+    result = {
+        'user_n_supported': user_score['n_supported'],
+        'user_mean_percentile': round(user_score['mean_percentile'], 1),
+        'user_total_effect': round(user_score['total_effect_strength'], 2),
+        'user_n_direction_match': user_score['n_direction_match'],
+        'user_n_testable': user_score['n_testable'],
+        'null_supported_mean': round(float(np.mean(null_supported)), 2),
+        'null_supported_std': round(float(np.std(null_supported)), 2),
+        'null_percentile_mean': round(float(np.mean(null_percentiles)), 1),
+        'null_percentile_std': round(float(np.std(null_percentiles)), 1),
+        'null_effect_mean': round(float(np.mean(null_total_effects)), 2),
+        'null_effect_std': round(float(np.std(null_total_effects)), 2),
+        'null_direction_mean': round(float(np.mean(null_dir_matches)), 2),
+        'p_supported': round(supported_rank, 4),
+        'p_percentile': round(percentile_rank, 4),
+        'p_total_effect': round(effect_rank, 4),
+        'p_direction': round(direction_rank, 4),
+        'n_permutations': n_permutations,
+        'n_claims': n_claims,
+        'n_unique_upstream': len(unique_up),
+        'n_unique_downstream': len(unique_down),
+    }
+
+    log.info(f"  Convergence results:")
+    log.info(f"    Supported: {user_score['n_supported']} "
+             f"(null: {result['null_supported_mean']} +/- {result['null_supported_std']}, "
+             f"p={result['p_supported']})")
+    log.info(f"    Mean pctl: {user_score['mean_percentile']:.1f} "
+             f"(null: {result['null_percentile_mean']} +/- {result['null_percentile_std']}, "
+             f"p={result['p_percentile']})")
+    log.info(f"    Total effect: {user_score['total_effect_strength']:.2f} "
+             f"(null: {result['null_effect_mean']} +/- {result['null_effect_std']}, "
+             f"p={result['p_total_effect']})")
+
+    return result
+
+
+def generate_summary_report(results_df, base_rate, disease_source, output_dir,
+                            specificity=None, convergence=None):
     grade_counts = results_df['confidence_grade'].value_counts()
     n = len(results_df)
 
@@ -1136,6 +1425,94 @@ def generate_summary_report(results_df, base_rate, disease_source, output_dir, s
             lines.append(
                 "**Bottom line**: Mixed specificity. Some metrics suggest your gene set is "
                 "special; others do not. Interpret individual claim grades with caution."
+            )
+        lines.append("")
+
+    if convergence:
+        lines.append("## Convergence Test")
+        lines.append("")
+        lines.append(
+            "This test asks: does the specific WIRING between your genes matter? "
+            "It keeps the exact same upstream and downstream genes but randomly "
+            "re-pairs them. If random pairings score equally well, then the individual "
+            "genes matter but the network connecting them does not."
+        )
+        lines.append("")
+
+        user_sup = convergence['user_n_supported']
+        null_sup_mean = convergence['null_supported_mean']
+        null_sup_std = convergence['null_supported_std']
+        p_sup = convergence['p_supported']
+        user_pct = convergence['user_mean_percentile']
+        null_pct_mean = convergence['null_percentile_mean']
+        p_pct = convergence['p_percentile']
+        user_eff = convergence['user_total_effect']
+        null_eff_mean = convergence['null_effect_mean']
+        null_eff_std = convergence['null_effect_std']
+        p_eff = convergence['p_total_effect']
+        n_testable = convergence['user_n_testable']
+        n_perms = convergence['n_permutations']
+
+        lines.append(
+            f"Claims: {convergence['n_claims']} ({convergence['n_unique_upstream']} "
+            f"upstream, {convergence['n_unique_downstream']} downstream). "
+            f"Permutations: {n_perms:,}."
+        )
+        lines.append("")
+        lines.append(f"| Metric | Actual wiring | Random pairings (mean +/- SD) | p-value | Interpretation |")
+        lines.append(f"|--------|--------------|------------------------------|---------|----------------|")
+
+        if p_sup < 0.05:
+            sup_interp = "Actual pairings produce MORE supported claims"
+        elif p_sup > 0.5:
+            sup_interp = "Random pairings score as well or better"
+        else:
+            sup_interp = "No significant difference"
+        lines.append(
+            f"| Supported claims | {user_sup}/{n_testable} | "
+            f"{null_sup_mean} +/- {null_sup_std} | {p_sup} | {sup_interp} |"
+        )
+
+        if p_pct < 0.05:
+            pct_interp = "Actual wiring captures stronger effects"
+        elif p_pct > 0.5:
+            pct_interp = "Effect sizes are typical for these genes"
+        else:
+            pct_interp = "No significant difference"
+        lines.append(
+            f"| Mean effect percentile | {user_pct} | "
+            f"{null_pct_mean} +/- {convergence['null_percentile_std']} | {p_pct} | {pct_interp} |"
+        )
+
+        if p_eff < 0.05:
+            eff_interp = "Total effect strength is concentrated by the wiring"
+        else:
+            eff_interp = "Random wiring captures similar total effects"
+        lines.append(
+            f"| Total effect strength | {user_eff} | "
+            f"{null_eff_mean} +/- {null_eff_std} | {p_eff} | {eff_interp} |"
+        )
+
+        lines.append("")
+
+        # Bottom-line
+        if p_sup < 0.05 and p_eff < 0.05:
+            lines.append(
+                "**Bottom line**: The specific connections between your genes produce "
+                "stronger and more numerous validated effects than random rewiring of "
+                "the same genes. The NETWORK STRUCTURE matters, not just the individual genes."
+            )
+        elif p_sup >= 0.05 and p_eff >= 0.05:
+            lines.append(
+                "**Bottom line**: Random pairings of the same genes produce similar results. "
+                "The individual genes may be important (check the specificity test), but the "
+                "specific connections between them do not add predictive power beyond what "
+                "any pairing of these genes would give."
+            )
+        else:
+            lines.append(
+                "**Bottom line**: Mixed results. Some metrics suggest the wiring matters; "
+                "others do not. The network structure may have partial biological meaning."
             )
         lines.append("")
 
@@ -1331,6 +1708,12 @@ def main():
                              'pool. Without this, TruthSeq auto-generates a pool from disease '
                              'expression data (Tier 2) if available, or falls back to all '
                              'knockdown genes.')
+    parser.add_argument('--convergence', action='store_true',
+                        help='Run convergence test: does the specific wiring between your '
+                             'genes matter, or would random pairings of the same genes '
+                             'produce similar results?')
+    parser.add_argument('--convergence-perms', type=int, default=1000,
+                        help='Number of permutations for convergence test (default: 1000)')
 
     args = parser.parse_args()
     os.makedirs(args.output, exist_ok=True)
@@ -1437,11 +1820,26 @@ def main():
             json.dump(specificity, f, indent=2)
         log.info(f"Specificity results saved to {spec_path}")
 
+    # Convergence test
+    convergence = None
+    if args.convergence and replogle_df is not None:
+        log.info("")
+        log.info("=== Convergence Test ===")
+        convergence = compute_convergence(
+            results_df, replogle_df, stats_df,
+            n_permutations=args.convergence_perms,
+        )
+        if convergence:
+            conv_path = os.path.join(args.output, "truthseq_convergence.json")
+            with open(conv_path, 'w') as f:
+                json.dump(convergence, f, indent=2)
+            log.info(f"Convergence results saved to {conv_path}")
+
     # Reports
     log.info("")
     log.info("=== Generating Reports ===")
     generate_summary_report(results_df, base_rate, disease_source, args.output,
-                            specificity=specificity)
+                            specificity=specificity, convergence=convergence)
     generate_heatmap(results_df, args.output)
 
     # Console summary
@@ -1481,6 +1879,30 @@ def main():
         else:
             print(f"  >> Mixed results — some metrics specific, others not.")
 
+    if convergence:
+        print("")
+        print("-" * 60)
+        print("Convergence Test")
+        print("-" * 60)
+        print(f"  {convergence['n_claims']} claims "
+              f"({convergence['n_unique_upstream']} upstream, "
+              f"{convergence['n_unique_downstream']} downstream)")
+        p_sup_c = convergence['p_supported']
+        p_eff_c = convergence['p_total_effect']
+        print(f"  Actual wiring:  {convergence['user_n_supported']}/{convergence['user_n_testable']} supported, "
+              f"total effect {convergence['user_total_effect']}")
+        print(f"  Random pairing: {convergence['null_supported_mean']} +/- {convergence['null_supported_std']} supported, "
+              f"total effect {convergence['null_effect_mean']} +/- {convergence['null_effect_std']}")
+        print(f"  p-value (supported): {p_sup_c}")
+        print(f"  p-value (total effect): {p_eff_c}")
+        if p_sup_c >= 0.05 and p_eff_c >= 0.05:
+            print(f"  >> The specific wiring does NOT matter — random pairings score similarly.")
+            print(f"     Individual genes may be special but the network structure is not.")
+        elif p_sup_c < 0.05 and p_eff_c < 0.05:
+            print(f"  >> The network WIRING matters — actual pairings outperform random rewiring.")
+        else:
+            print(f"  >> Mixed results — some metrics suggest wiring matters, others do not.")
+
     print("")
     print(f"Output: {args.output}/")
     print(f"  truthseq_results.csv    — full evidence table")
@@ -1488,6 +1910,8 @@ def main():
     print(f"  truthseq_heatmap.png    — confidence visualization")
     if specificity:
         print(f"  truthseq_specificity.json — specificity test results")
+    if convergence:
+        print(f"  truthseq_convergence.json — convergence test results")
     print("")
 
     return 0
