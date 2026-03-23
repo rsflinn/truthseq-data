@@ -609,8 +609,15 @@ def auto_download_data():
 
 @st.cache_data(show_spinner="Loading knockdown data...")
 def load_replogle_data(effects_path, stats_path=None):
-    """Load the Replogle Perturb-seq data."""
+    """Load the Replogle Perturb-seq data with memory optimization."""
     effects_df = pd.read_parquet(effects_path)
+
+    # Convert repeated string columns to categorical — cuts memory ~90%.
+    # 37M rows with ~8K unique gene names: stores each string once, uses int indices.
+    for col in ['knocked_down_gene', 'affected_gene', 'cell_line']:
+        if col in effects_df.columns:
+            effects_df[col] = effects_df[col].astype('category')
+
     stats_df = None
     if stats_path and os.path.exists(stats_path):
         stats_df = pd.read_parquet(stats_path)
