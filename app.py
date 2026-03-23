@@ -529,30 +529,25 @@ TYPEWRITER_JS = """
 # Data Loading (cached) + Auto-Download for Cloud Deployment
 # ============================================================
 
-# Figshare source for Replogle Perturb-seq data (Replogle et al. 2022, Cell)
-FIGSHARE_K562_URL = "https://ndownloader.figshare.com/files/35773217"
-FIGSHARE_K562_H5AD = "K562_gwps_normalized_bulk_01.h5ad"
+# Pre-built parquet files hosted on GitHub Releases (no scanpy needed)
+GITHUB_RELEASE_BASE = "https://github.com/rsflinn/truthseq/releases/download/v1.0.0"
+EFFECTS_URL = f"{GITHUB_RELEASE_BASE}/replogle_knockdown_effects.parquet"
+STATS_URL = f"{GITHUB_RELEASE_BASE}/replogle_knockdown_stats.parquet"
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
 
-def _ensure_data_dir():
-    """Create data directory if it doesn't exist."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    return DATA_DIR
-
-
-def _download_h5ad(url, output_path, size_mb=357):
-    """Download h5ad from Figshare with Streamlit progress bar."""
+def _download_file(url, output_path, label="data"):
+    """Download a file with Streamlit progress bar."""
     import requests
 
     if os.path.exists(output_path):
         existing_mb = os.path.getsize(output_path) / 1024 / 1024
-        if existing_mb > 50:
+        if existing_mb > 0.1:
             return output_path
 
-    progress = st.progress(0, text=f"Downloading Replogle Perturb-seq data (~{size_mb} MB)...")
+    progress = st.progress(0, text=f"Downloading {label}...")
 
-    resp = requests.get(url, stream=True, timeout=30)
+    resp = requests.get(url, stream=True, timeout=60)
     resp.raise_for_status()
 
     total = int(resp.headers.get('content-length', 0))
@@ -565,157 +560,42 @@ def _download_h5ad(url, output_path, size_mb=357):
             if total > 0:
                 pct = downloaded / total
                 mb_done = downloaded / 1024 / 1024
-                progress.progress(pct, text=f"Downloading... {mb_done:.0f}/{total/1024/1024:.0f} MB")
+                progress.progress(pct, text=f"Downloading {label}... {mb_done:.0f}/{total/1024/1024:.0f} MB")
 
-    progress.progress(1.0, text="Download complete.")
+    progress.progress(1.0, text=f"{label} ready.")
     return output_path
-
-
-def _process_h5ad_to_parquet(h5ad_path, effects_path, stats_path, cell_type='K562'):
-    """Process h5ad into parquet files TruthSeq uses for validation."""
-    import re
-    import scanpy as sc
-
-    progress = st.progress(0, text="Processing Perturb-seq data (this takes a few minutes on first run)...")
-
-    adata = sc.read_h5ad(h5ad_path)
-    progress.progress(0.2, text="Processing... loaded h5ad, extracting knockdown effects...")
-
-    # Parse gene names from obs index (format: NUMBER_GENENAME_PERTURBATION_ENSEMBLID)
-    raw_index = adata.obs_names.values.astype(str)
-
-    def clean_gene_name(name):
-        name = re.sub(r'^\d+_', '', name)
-        name = re.sub(r'_ENSG\d+', '', name)
-        name = re.sub(r'_P\d+(P\d+)?', '', name)
-        return name
-
-    gene_labels = np.array([clean_gene_name(name) for name in raw_index])
-
-    # Map affected gene columns
-    if 'gene_name' in adata.var.columns:
-        col_names = adata.var['gene_name'].values.astype(str)
-    else:
-        col_names = adata.var_names.values.astype(str)
-
-    progress.progress(0.3, text="Processing... building expression matrix...")
-
-    expr_data = adata.X
-    if hasattr(expr_data, 'toarray'):
-        expr_data = expr_data.toarray()
-
-    expr_matrix = pd.DataFrame(expr_data, index=gene_labels, columns=col_names)
-
-    if expr_matrix.columns.duplicated().any():
-        expr_matrix = expr_matrix.T.groupby(level=0).mean().T
-
-    # Check if data needs Z-scoring
-    sample_vals = expr_matrix.iloc[:100].values.flatten()
-    sample_vals = sample_vals[~np.isnan(sample_vals)]
-    needs_zscore = float(np.median(np.abs(sample_vals))) < 0.5
-
-    progress.progress(0.4, text="Processing... computing knockdown effects per gene...")
-
-    unique_kd_genes = sorted(set(gene_labels))
-    all_pairs = []
-    all_stats = []
-    z_threshold = 0.5
-
-    for i, kd_gene in enumerate(unique_kd_genes):
-        mask = gene_labels == kd_gene
-        kd_expr = expr_matrix.loc[mask]
-        if len(kd_expr) == 0:
-            continue
-
-        mean_effects = kd_expr.mean(axis=0)
-
-        if needs_zscore:
-            kd_mean = float(mean_effects.mean())
-            kd_std = float(mean_effects.std())
-            z_effects = (mean_effects - kd_mean) / kd_std if kd_std > 0 else mean_effects * 0
-        else:
-            z_effects = mean_effects
-
-        abs_z = z_effects.abs()
-
-        stats_row = {
-            'knocked_down_gene': kd_gene,
-            'n_genes_tested': len(z_effects),
-            'n_replicates': int(mask.sum()),
-            'median_abs_z': float(abs_z.median()),
-            'mean_abs_z': float(abs_z.mean()),
-            'std_abs_z': float(abs_z.std()),
-            'max_abs_z': float(abs_z.max()),
-            'n_sig': int((abs_z > z_threshold).sum()),
-        }
-        for q in [5, 10, 25, 50, 75, 80, 85, 90, 95, 97, 99]:
-            stats_row[f'q{q:02d}'] = float(np.percentile(abs_z.values, q))
-        all_stats.append(stats_row)
-
-        sig_mask = abs_z > z_threshold
-        sig_genes = z_effects[sig_mask]
-        for affected_gene, z_score in sig_genes.items():
-            if affected_gene == kd_gene:
-                continue
-            all_pairs.append({
-                'knocked_down_gene': kd_gene,
-                'affected_gene': affected_gene,
-                'z_score': round(float(z_score), 4),
-                'cell_line': cell_type,
-            })
-
-        if (i + 1) % 200 == 0:
-            pct = 0.4 + 0.5 * (i + 1) / len(unique_kd_genes)
-            progress.progress(pct, text=f"Processing... {i+1}/{len(unique_kd_genes)} knockdowns")
-
-    progress.progress(0.95, text="Processing... saving parquet files...")
-
-    effects_df = pd.DataFrame(all_pairs)
-    effects_df.to_parquet(effects_path, index=False)
-
-    stats_df = pd.DataFrame(all_stats)
-    stats_df.to_parquet(stats_path, index=False)
-
-    progress.progress(1.0, text=f"Ready: {len(all_stats)} knockdowns, {len(all_pairs):,} gene pairs.")
-    return effects_path, stats_path
 
 
 def auto_download_data():
     """
-    Auto-download and process Replogle data if parquet files don't exist.
+    Download pre-built parquet files from GitHub Releases if not found locally.
     Returns (effects_path, stats_path) or (None, None) on failure.
     """
-    data_dir = _ensure_data_dir()
+    os.makedirs(DATA_DIR, exist_ok=True)
 
-    effects_path = os.path.join(data_dir, "replogle_knockdown_effects.parquet")
-    stats_path = os.path.join(data_dir, "replogle_knockdown_stats.parquet")
+    effects_path = os.path.join(DATA_DIR, "replogle_knockdown_effects.parquet")
+    stats_path = os.path.join(DATA_DIR, "replogle_knockdown_stats.parquet")
 
     # If parquets already exist, return them
     if os.path.exists(effects_path) and os.path.exists(stats_path):
         return effects_path, stats_path
 
-    # Check if parquets exist in the current working directory
+    # Check common local locations
     for check_dir in ['.', os.path.expanduser('~')]:
         eff = os.path.join(check_dir, "replogle_knockdown_effects.parquet")
         sta = os.path.join(check_dir, "replogle_knockdown_stats.parquet")
         if os.path.exists(eff):
             return eff, sta if os.path.exists(sta) else None
 
-    # Need to download and process
+    # Download from GitHub Releases
     st.info(
-        "First-time setup: downloading Replogle Perturb-seq reference data from Figshare "
-        "(~357 MB). This only happens once."
+        "First-time setup: downloading Replogle Perturb-seq reference data (~148 MB). "
+        "This only happens once."
     )
 
     try:
-        h5ad_path = os.path.join(data_dir, FIGSHARE_K562_H5AD)
-        _download_h5ad(FIGSHARE_K562_URL, h5ad_path, size_mb=357)
-        _process_h5ad_to_parquet(h5ad_path, effects_path, stats_path, cell_type='K562')
-
-        # Clean up h5ad to save disk space (parquets are what we need)
-        if os.path.exists(h5ad_path):
-            os.remove(h5ad_path)
-
+        _download_file(EFFECTS_URL, effects_path, "knockdown effects (147 MB)")
+        _download_file(STATS_URL, stats_path, "knockdown stats (<1 MB)")
         return effects_path, stats_path
 
     except Exception as e:
